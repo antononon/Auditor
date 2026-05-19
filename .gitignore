@@ -1,0 +1,4 @@
+.notebooklm/
+.venv/
+.venv313/
+__pycache__/
