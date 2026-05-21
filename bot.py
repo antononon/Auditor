@@ -110,6 +110,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logging.info("Saved %s to %s", url, output_path)
     except BaseException:
         logging.exception("Could not process %s", url)
+        await message.reply_text(
+            "Не смог обработать ссылку. Ошибка уже записана в лог сервера.",
+            disable_web_page_preview=True,
+        )
 
 
 def main() -> None:
