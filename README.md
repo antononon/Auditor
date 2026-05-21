@@ -7,6 +7,8 @@ It can save notes either:
 - locally into an Obsidian vault folder;
 - remotely to a server folder over `ssh`/`scp`.
 
+It can also run as a quiet Telegram bot: send it a YouTube link and it saves the note without replying in chat.
+
 ## What It Does
 
 1. Creates a NotebookLM notebook.
@@ -129,4 +131,62 @@ The repo ignores:
 
 ```bash
 python script.py "https://www.youtube.com/watch?v=tXiK8PmYgZk" --remote-vault "antonio@example.com:/srv/obsidian/Videos"
+```
+
+## Telegram Bot
+
+Create a bot with [@BotFather](https://t.me/BotFather), copy the token, then set:
+
+```bash
+export TELEGRAM_BOT_TOKEN="123456:telegram-bot-token"
+export OBSIDIAN_VIDEO_VAULT="/srv/obsidian/Videos"
+```
+
+Start the bot:
+
+```bash
+python bot.py
+```
+
+Now send the bot a YouTube link. It will process the video and save the Markdown note without replying in Telegram.
+
+To restrict the bot to specific Telegram users:
+
+```bash
+export TELEGRAM_ALLOWED_USER_IDS="123456789,987654321"
+```
+
+If the bot runs on one machine but should upload notes to another server:
+
+```bash
+export OBSIDIAN_REMOTE_VAULT="user@server:/srv/obsidian/Videos"
+```
+
+### systemd Service
+
+Example `/etc/systemd/system/auditor-bot.service`:
+
+```ini
+[Unit]
+Description=Auditor Telegram bot
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/Auditor
+Environment=TELEGRAM_BOT_TOKEN=123456:telegram-bot-token
+Environment=OBSIDIAN_VIDEO_VAULT=/srv/obsidian/Videos
+ExecStart=/opt/Auditor/.venv/bin/python /opt/Auditor/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now auditor-bot
+sudo journalctl -u auditor-bot -f
 ```

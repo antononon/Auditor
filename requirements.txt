@@ -1,1 +1,2 @@
 notebooklm-py[cookies]>=0.3.3
+python-telegram-bot>=22.0
