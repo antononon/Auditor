@@ -82,6 +82,9 @@ def main() -> None:
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.WARNING)
+    logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 
     token = get_required_env("TELEGRAM_BOT_TOKEN")
     app = Application.builder().token(token).build()
