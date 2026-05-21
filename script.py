@@ -14,15 +14,67 @@ from pathlib import Path
 DEFAULT_NOTEBOOKLM_HOME = Path(__file__).resolve().parent / ".notebooklm"
 os.environ.setdefault("NOTEBOOKLM_HOME", str(DEFAULT_NOTEBOOKLM_HOME))
 
-QUERY = """
-Проанализируй видео и верни строго в формате:
+PROMPT_TEMPLATE = """
+Ты — строгий аналитик и ассистент по извлечению знаний. Твоя задача — анализировать источники (видео, статьи, документы) и выдавать максимально плотную, структурированную выжимку без воды, вводных слов и лирики, на русском языке.
 
-tags: [#видео, #тема1, #тема2]
-## Главная идея
-## Ключевые тезисы (с таймкодами)
-## Связанные темы для Obsidian
-## Открытые вопросы
+ЦЕЛЬ: создать идеальную заметку для базы знаний Obsidian. Извлекай ВСЕ полезные факты, алгоритмы, правила и концепции.
+
+ПРАВИЛО ТЕГОВ:
+Используй ТОЛЬКО теги из этого списка. Выбери от 1 до 3 самых подходящих. Запрещено придумывать новые теги.
+
+Система и база знаний: #система, #база_знаний, #инсайт, #референс, #алгоритм.
+Медиа, Фото и Видео: #фотография, #видеомонтаж, #режиссура, #цветокоррекция, #сценарий, #DaVinciResolve, #Sony, #композиция, #свет, #оптика, #кино, #YouTube, #контент, #оборудование.
+Инженерия, Электрика и Электроника: #электрика, #электроника, #схемотехника, #умный_дом, #KNX, #автоматизация, #монтаж, #инструмент, #безопасность, #VDE.
+IT, Программирование и Серверы: #программирование, #сервер, #Linux, #TypeScript, #AI, #нейросети, #боты, #Telegram_API, #архитектура_ПО, #хостинг, #bash, #prompt_engineering.
+Финансы и Инвестиции: #финансы, #инвестиции, #ETF, #криптовалюта, #бюджет, #капитал, #пассивный_доход, #акции, #экономика, #трейдинг, #налоги, #VWL.
+Здоровье, Спорт и Outdoor: #здоровье, #спорт, #бег, #тренажерный_зал, #фитнес, #питание, #биохакинг, #восстановление, #сон, #походы, #горы, #Альпы, #треккинг, #экипировка, #outdoor.
+Музыка и Звук: #музыка, #DJing, #саунд_дизайн, #сведение, #мастеринг, #теория_музыки, #синтезаторы, #акустика.
+Обучение и Языки: #немецкий, #английский, #обучение, #Ausbildung, #экзамены.
+Психология, Продуктивность и Отношения: #психология, #саморазвитие, #зависимости, #продуктивность, #тайм_менеджмент, #планирование, #СДВГ, #фокус, #дисциплина, #мышление, #отношения, #коммуникация, #соционика, #лидерство.
+Духовность и Мировоззрение: #духовное, #служение, #собрание, #Библия, #философия.
+
+ПРАВИЛО ОФОРМЛЕНИЯ OBSIDIAN:
+- Обязательно указывай таймкоды или страницы в скобках к ключевым фактам.
+- Интегрируй бэклинки [[ ]] прямо в текст там, где они помогают связать понятия.
+- Не добавляй вводные объяснения до или после заметки.
+
+ЗАДАЧА:
+Проанализируй этот источник и сделай выжимку строго по структуре для Obsidian. Достань всю фактологию, пошаговые инструкции и скрытые смыслы. Никакой воды, только сухой остаток. Назначь теги из разрешенного списка.
+
+ОБЯЗАТЕЛЬНАЯ СТРУКТУРА ОТВЕТА. Выдавай строго Markdown:
+
+---
+tags: [#NotebookLM, #ВыбранныйТег1, #ВыбранныйТег2]
+source: {source}
+date: {date}
+type: knowledge-base
+---
+
+# **[Сгенерируй емкое, точное и цепляющее название для этого материала, максимум 5-7 слов]**
+
+## 🎯 Суть (в одном предложении)
+[Максимально емкое определение того, о чем материал]
+
+## 🧠 Ключевые концепции и термины
+[Если в материале есть новые термины, законы или определения — выпиши их сюда в формате: **Термин** — определение.]
+
+## 📌 Глубокая выжимка
+[Здесь должна быть плотная, структурированная информация. Используй подзаголовки (###), маркированные списки и таблицы. Выпиши все важные мысли и аргументы. Указывай (источник: мм:сс). Интегрируй бэклинки `[[ ]]` прямо в текст.]
+
+### Главный инсайт
+> [Выдели сюда самую прорывную мысль блока]
+
+## ⚙️ Практические шаги / Алгоритмы
+- [Шаг 1. Конкретное действие] (источник: мм:сс)
+- [Шаг 2. Конкретное действие] (источник: мм:сс)
+
+## ❓ Вопросы для изучения
+- [Что осталось нераскрытым?]
 """.strip()
+
+
+def build_query(source: str) -> str:
+    return PROMPT_TEMPLATE.format(source=source, date=date.today())
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +136,14 @@ def slugify(value: str, fallback: str) -> str:
 
 
 def extract_title(response: str) -> str:
+    match = re.search(r"^#\s+\*\*(.+?)\*\*\s*$", response, flags=re.MULTILINE)
+    if match:
+        return match.group(1).strip()
+
+    match = re.search(r"^#\s+(.+?)\s*$", response, flags=re.MULTILINE)
+    if match:
+        return match.group(1).strip("* ").strip()
+
     match = re.search(r"##\s*Главная идея\s*\n+(.+)", response)
     if match:
         return match.group(1).strip()
@@ -148,6 +208,22 @@ def import_browser_cookies(browser: str, profile: str | None) -> None:
     print(f"Cookies сохранены: {path}")
 
 
+def ensure_frontmatter(response: str, url: str) -> str:
+    response = response.strip()
+    if response.startswith("---"):
+        return response + "\n"
+
+    return f"""---
+tags: [#NotebookLM, #YouTube]
+source: {url}
+date: {date.today()}
+type: knowledge-base
+---
+
+{response}
+"""
+
+
 async def create_note(url: str, vault_path: Path, profile: str | None) -> Path:
     try:
         from notebooklm import NotebookLMClient
@@ -164,27 +240,18 @@ async def create_note(url: str, vault_path: Path, profile: str | None) -> Path:
         async with await NotebookLMClient.from_storage(**client_kwargs) as client:
             notebook = await client.notebooks.create(f"Video {date.today()}")
             await client.sources.add_url(notebook.id, url, wait=True)
-            result = await client.chat.ask(notebook.id, QUERY)
+            result = await client.chat.ask(notebook.id, build_query(url))
     except FileNotFoundError:
         fail(
             "NotebookLM не авторизован. Запусти скрипт с "
             "--browser-cookies chrome, если ты уже вошёл в Google в Chrome."
         )
 
-    response = getattr(result, "answer", str(result))
+    response = ensure_frontmatter(getattr(result, "answer", str(result)), url)
     title = extract_title(response)
     filename = f"{slugify(title, f'video-{date.today()}')}.md"
     output_path = vault_path / filename
-
-    frontmatter = f"""---
-tags: [видео, к-обработке]
-source: {url}
-date: {date.today()}
-type: video-note
----
-
-"""
-    output_path.write_text(frontmatter + response + "\n", encoding="utf-8")
+    output_path.write_text(response, encoding="utf-8")
     return output_path
 
 

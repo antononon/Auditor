@@ -11,6 +11,7 @@ from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from script import create_note, upload_to_remote
 
 
+TELEGRAM_MESSAGE_LIMIT = 3900
 YOUTUBE_URL_RE = re.compile(
     r"https?://(?:www\.)?(?:youtube\.com/watch\?[^ \n]+|youtu\.be/[^ \n]+)",
     re.IGNORECASE,
@@ -44,6 +45,36 @@ def extract_youtube_url(text: str) -> str | None:
     return match.group(0).rstrip(").,;]")
 
 
+def split_telegram_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    chunks = []
+    current = ""
+
+    for line in text.splitlines(keepends=True):
+        if len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            for index in range(0, len(line), limit):
+                chunks.append(line[index : index + limit])
+            continue
+
+        if len(current) + len(line) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+async def send_note(message, note: str) -> None:
+    for chunk in split_telegram_message(note):
+        await message.reply_text(chunk, disable_web_page_preview=True)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_user_ids: set[int] = context.application.bot_data["allowed_user_ids"]
     user = update.effective_user
@@ -67,11 +98,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if remote_vault:
             with tempfile.TemporaryDirectory(prefix="auditor-bot-") as temp_dir:
                 output_path = await create_note(url, Path(temp_dir), profile)
+                note = output_path.read_text(encoding="utf-8")
                 remote_path = await asyncio.to_thread(upload_to_remote, output_path, remote_vault)
+                await send_note(message, note)
                 logging.info("Saved %s to %s", url, remote_path)
             return
 
         output_path = await create_note(url, Path(vault).expanduser(), profile)
+        note = output_path.read_text(encoding="utf-8")
+        await send_note(message, note)
         logging.info("Saved %s to %s", url, output_path)
     except BaseException:
         logging.exception("Could not process %s", url)
