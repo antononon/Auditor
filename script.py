@@ -44,7 +44,7 @@ IT, Программирование и Серверы: #программиро�
 ОБЯЗАТЕЛЬНАЯ СТРУКТУРА ОТВЕТА. Выдавай строго Markdown:
 
 ---
-tags: [#NotebookLM, #ВыбранныйТег1, #ВыбранныйТег2]
+tags: [#ВыбранныйТег1, #ВыбранныйТег2]
 source: {source}
 date: {date}
 type: knowledge-base
@@ -214,7 +214,7 @@ def ensure_frontmatter(response: str, url: str) -> str:
         return response + "\n"
 
     return f"""---
-tags: [#NotebookLM, #YouTube]
+tags: [#YouTube]
 source: {url}
 date: {date.today()}
 type: knowledge-base
