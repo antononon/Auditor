@@ -10,15 +10,16 @@ next link, so every save is validated before it is allowed to land.
 
 import html
 import os
-import shutil
 import sys
-from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 from urllib.parse import parse_qs
 
-PROMPT_FILE = Path(os.environ.get("AUDITOR_PROMPT_FILE", "/opt/Auditor/prompt.md"))
-BACKUP_DIR = Path(os.environ.get("AUDITOR_PROMPT_BACKUPS", "/opt/Auditor/.prompt-backups"))
+sys.path.insert(0, "/opt/Auditor")
+
+# Shared with the Telegram commands, so the two entry points can never disagree
+# about what counts as a valid prompt.
+from script import PROMPT_FILE, save_prompt, validate_prompt  # noqa: E402
+
 HOST = os.environ.get("AUDITOR_EDITOR_HOST", "127.0.0.1")
 PORT = int(os.environ.get("AUDITOR_EDITOR_PORT", "8765"))
 MAX_BODY_BYTES = 512 * 1024
@@ -83,38 +84,11 @@ PAGE = """<!doctype html>
 """
 
 
-def validate(text: str) -> str | None:
-    """Return an error message if this template would blow up at request time."""
-    if not text.strip():
-        return "Промпт пустой."
-    try:
-        text.format(source="https://example.com", date=date.today())
-    except KeyError as exc:
-        return f"Неизвестный плейсхолдер {exc}. Разрешены только {{source}} и {{date}}."
-    except (IndexError, ValueError):
-        return (
-            "Непарная фигурная скобка. Для литеральной скобки в тексте "
-            "используй {{ и }}."
-        )
-    return None
-
-
 def read_prompt() -> str:
     try:
         return PROMPT_FILE.read_text(encoding="utf-8")
     except OSError:
         return ""
-
-
-def save_prompt(text: str) -> None:
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    if PROMPT_FILE.exists():
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        shutil.copy2(PROMPT_FILE, BACKUP_DIR / f"prompt-{stamp}.md")
-    # Write-then-rename so a half-written file can never be picked up mid-save.
-    tmp = PROMPT_FILE.with_suffix(".md.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(PROMPT_FILE)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -152,7 +126,7 @@ class Handler(BaseHTTPRequestHandler):
         # Browsers submit CRLF; keep the file in unix line endings.
         submitted = submitted.replace("\r\n", "\n")
 
-        error = validate(submitted)
+        error = validate_prompt(submitted)
         if error:
             # Hand back what they typed so nothing is lost to a validation bounce.
             self._render(submitted, error, "err", 400)

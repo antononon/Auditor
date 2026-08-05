@@ -6,9 +6,17 @@ import tempfile
 from pathlib import Path
 
 from telegram import Update
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-from script import AuthExpired, create_note, upload_to_remote
+from script import (
+    AuthExpired,
+    create_note,
+    latest_prompt_backup,
+    load_prompt_template,
+    save_prompt,
+    upload_to_remote,
+    validate_prompt,
+)
 
 
 TELEGRAM_MESSAGE_LIMIT = 3900
@@ -75,10 +83,106 @@ async def send_note(message, note: str) -> None:
         await message.reply_text(chunk, disable_web_page_preview=True)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def is_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     allowed_user_ids: set[int] = context.application.bot_data["allowed_user_ids"]
     user = update.effective_user
-    if allowed_user_ids and (user is None or user.id not in allowed_user_ids):
+    if not allowed_user_ids:
+        return True
+    return user is not None and user.id in allowed_user_ids
+
+
+async def show_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the current prompt so it can be copied, edited and sent back."""
+    if not is_allowed(update, context):
+        return
+
+    message = update.effective_message
+    prompt = load_prompt_template()
+
+    await message.reply_text(
+        "Текущий промпт ниже. Скопируй, поправь и пришли обратно как:\n"
+        "/setprompt <текст>\n\n"
+        "Плейсхолдеры {source} и {date} должны остаться. "
+        "Откатить последнюю правку — /promptundo",
+        disable_web_page_preview=True,
+    )
+    # Sent raw, with no parse_mode: the prompt is full of #, * and [] that any
+    # markdown parser would either mangle or reject outright.
+    for chunk in split_telegram_message(prompt):
+        await message.reply_text(chunk, disable_web_page_preview=True)
+
+
+async def set_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Replace the prompt with the text following the command, or a replied-to message."""
+    if not is_allowed(update, context):
+        return
+
+    message = update.effective_message
+    text = message.text or ""
+
+    # Everything after "/setprompt", newlines and all.
+    _, _, new_prompt = text.partition(" ")
+    if not new_prompt.strip() and message.reply_to_message:
+        new_prompt = message.reply_to_message.text or ""
+
+    new_prompt = new_prompt.strip()
+    if not new_prompt:
+        await message.reply_text(
+            "После /setprompt нужен сам текст промпта "
+            "(или ответь этой командой на сообщение с ним).",
+            disable_web_page_preview=True,
+        )
+        return
+
+    error = validate_prompt(new_prompt)
+    if error:
+        await message.reply_text(f"Не сохранил: {error}", disable_web_page_preview=True)
+        return
+
+    try:
+        backup = save_prompt(new_prompt)
+    except OSError as exc:
+        logging.exception("Could not save prompt")
+        await message.reply_text(f"Не смог записать файл: {exc}", disable_web_page_preview=True)
+        return
+
+    logging.info("Prompt updated (%d chars), backup: %s", len(new_prompt), backup)
+    await message.reply_text(
+        f"Промпт сохранён ({len(new_prompt)} символов). "
+        "Применится со следующей ссылки. Откатить — /promptundo",
+        disable_web_page_preview=True,
+    )
+
+
+async def undo_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Roll back to the version saved before the last edit."""
+    if not is_allowed(update, context):
+        return
+
+    message = update.effective_message
+    backup = latest_prompt_backup()
+    if backup is None:
+        await message.reply_text("Откатывать нечего — сохранённых версий нет.")
+        return
+
+    try:
+        previous = backup.read_text(encoding="utf-8")
+        save_prompt(previous)
+    except OSError as exc:
+        logging.exception("Could not restore prompt")
+        await message.reply_text(f"Не смог восстановить: {exc}", disable_web_page_preview=True)
+        return
+
+    logging.info("Prompt rolled back to %s", backup.name)
+    await message.reply_text(
+        f"Откатил к версии от {backup.stem.removeprefix('prompt-')}. "
+        "Ещё раз /promptundo вернёт обратно.",
+        disable_web_page_preview=True,
+    )
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update, context):
         return
 
     message = update.effective_message
@@ -146,6 +250,9 @@ def main() -> None:
     app.bot_data["remote_vault"] = os.environ.get("OBSIDIAN_REMOTE_VAULT")
     app.bot_data["profile"] = os.environ.get("NOTEBOOKLM_PROFILE")
 
+    app.add_handler(CommandHandler("prompt", show_prompt))
+    app.add_handler(CommandHandler("setprompt", set_prompt))
+    app.add_handler(CommandHandler("promptundo", undo_prompt))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logging.info("Auditor Telegram bot started")
     app.run_polling(allowed_updates=Update.MESSAGE)

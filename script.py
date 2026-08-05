@@ -87,6 +87,11 @@ PROMPT_FILE = Path(
 )
 
 
+PROMPT_BACKUP_DIR = Path(
+    os.environ.get("AUDITOR_PROMPT_BACKUPS", str(Path(__file__).resolve().parent / ".prompt-backups"))
+)
+
+
 def load_prompt_template() -> str:
     """The edited prompt if there is one, otherwise the built-in default."""
     try:
@@ -94,6 +99,50 @@ def load_prompt_template() -> str:
     except OSError:
         return DEFAULT_PROMPT_TEMPLATE
     return text or DEFAULT_PROMPT_TEMPLATE
+
+
+def validate_prompt(text: str) -> str | None:
+    """Return a human-readable reason this template would fail, or None if fine.
+
+    The prompt is a .format() string, so a single unpaired brace anywhere would
+    raise on the next link and take the bot down. Every edit goes through here
+    before it is allowed to land, whichever way it arrived.
+    """
+    if not text.strip():
+        return "Промпт пустой."
+    try:
+        text.format(source="https://example.com", date=date.today())
+    except KeyError as exc:
+        return f"Неизвестный плейсхолдер {exc}. Разрешены только {{source}} и {{date}}."
+    except (IndexError, ValueError):
+        return "Непарная фигурная скобка. Для литеральной скобки в тексте используй {{ и }}."
+    return None
+
+
+def save_prompt(text: str) -> Path | None:
+    """Write a validated prompt, keeping the previous version. Returns the backup path."""
+    from datetime import datetime
+
+    backup: Path | None = None
+    PROMPT_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    if PROMPT_FILE.exists():
+        backup = PROMPT_BACKUP_DIR / f"prompt-{datetime.now():%Y%m%d-%H%M%S}.md"
+        shutil.copy2(PROMPT_FILE, backup)
+
+    # Write-then-rename so a half-written file is never picked up mid-save.
+    tmp = PROMPT_FILE.with_suffix(".md.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(PROMPT_FILE)
+    return backup
+
+
+def latest_prompt_backup() -> Path | None:
+    """Most recent saved version, for undoing an edit."""
+    try:
+        backups = sorted(PROMPT_BACKUP_DIR.glob("prompt-*.md"))
+    except OSError:
+        return None
+    return backups[-1] if backups else None
 
 
 def build_query(source: str) -> str:
