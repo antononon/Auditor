@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -14,7 +15,22 @@ from pathlib import Path
 DEFAULT_NOTEBOOKLM_HOME = Path(__file__).resolve().parent / ".notebooklm"
 os.environ.setdefault("NOTEBOOKLM_HOME", str(DEFAULT_NOTEBOOKLM_HOME))
 
-PROMPT_TEMPLATE = """
+# One NotebookLM round-trip has to upload a source, wait for it to be indexed and
+# then wait for the answer, so the ceiling is generous. Without it a stuck request
+# hangs the bot forever.
+REQUEST_TIMEOUT_SECONDS = float(os.environ.get("NOTEBOOKLM_TIMEOUT", "600"))
+MAX_ATTEMPTS = int(os.environ.get("NOTEBOOKLM_MAX_ATTEMPTS", "4"))
+INITIAL_BACKOFF_SECONDS = float(os.environ.get("NOTEBOOKLM_BACKOFF", "5"))
+# Escape hatch for debugging a bad answer: keeps the scratch notebook around.
+KEEP_NOTEBOOKS = os.environ.get("NOTEBOOKLM_KEEP_NOTEBOOKS", "").lower() in ("1", "true", "yes")
+
+logger = logging.getLogger(__name__)
+
+
+class AuthExpired(RuntimeError):
+    """The NotebookLM session is dead. Retrying cannot fix it -- only a new login can."""
+
+DEFAULT_PROMPT_TEMPLATE = """
 Ты — строгий аналитик и ассистент по извлечению знаний. Твоя задача — анализировать источники (видео, статьи, документы) и выдавать максимально плотную, структурированную выжимку без «воды», вводных слов и лирики, на русском языке. 
 
 ЦЕЛЬ: Создать идеальную заметку для базы знаний Obsidian. Извлекай ВСЕ полезные факты, алгоритмы, правила и концепции.
@@ -64,8 +80,24 @@ type: knowledge-base
 """.strip()
 
 
+# Kept outside the code so it can be edited without a deploy. Read fresh on every
+# request, so an edit takes effect on the next link with no restart.
+PROMPT_FILE = Path(
+    os.environ.get("AUDITOR_PROMPT_FILE", str(Path(__file__).resolve().parent / "prompt.md"))
+)
+
+
+def load_prompt_template() -> str:
+    """The edited prompt if there is one, otherwise the built-in default."""
+    try:
+        text = PROMPT_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return DEFAULT_PROMPT_TEMPLATE
+    return text or DEFAULT_PROMPT_TEMPLATE
+
+
 def build_query(source: str) -> str:
-    return PROMPT_TEMPLATE.format(source=source, date=date.today())
+    return load_prompt_template().format(source=source, date=date.today())
 
 
 def parse_args() -> argparse.Namespace:
@@ -215,30 +247,103 @@ type: knowledge-base
 """
 
 
-async def create_note(url: str, vault_path: Path, profile: str | None) -> Path:
-    try:
-        from notebooklm import NotebookLMClient
-    except ImportError:
-        fail("пакет не установлен. Выполни: python3 -m pip install notebooklm-py")
+def _error_groups():
+    """Exception classes split by whether retrying stands a chance.
 
-    vault_path.mkdir(parents=True, exist_ok=True)
+    Imported lazily because notebooklm is an optional import everywhere else here.
+    """
+    from notebooklm import exceptions as nlm
+
+    fatal_auth = (nlm.AuthError, nlm.ConfigurationError)
+    retryable = (
+        nlm.NetworkError,
+        nlm.RPCTimeoutError,
+        nlm.ServerError,
+        nlm.RateLimitError,
+    )
+    return fatal_auth, retryable
+
+
+async def _ask_notebooklm(url: str, profile: str | None) -> str:
+    """A single full round-trip: create a notebook, add the source, ask the question.
+
+    The notebook is a scratchpad -- the answer is all we keep -- so it is deleted
+    afterwards. Leaving them behind slowly fills the account up to the NotebookLM
+    notebook cap, at which point creation starts failing and the bot dies with it.
+    """
+    from notebooklm import NotebookLMClient
 
     client_kwargs = {}
     if profile:
         client_kwargs["profile"] = profile
 
-    try:
-        async with await NotebookLMClient.from_storage(**client_kwargs) as client:
-            notebook = await client.notebooks.create(f"Video {date.today()}")
+    async with await NotebookLMClient.from_storage(**client_kwargs) as client:
+        notebook = await client.notebooks.create(f"Video {date.today()}")
+        try:
             await client.sources.add_url(notebook.id, url, wait=True)
             result = await client.chat.ask(notebook.id, build_query(url))
-    except FileNotFoundError:
-        fail(
-            "NotebookLM не авторизован. Запусти скрипт с "
-            "--browser-cookies chrome, если ты уже вошёл в Google в Chrome."
-        )
+        finally:
+            if not KEEP_NOTEBOOKS:
+                await _discard_notebook(client, notebook.id)
 
-    response = ensure_frontmatter(getattr(result, "answer", str(result)), url)
+    return getattr(result, "answer", str(result))
+
+
+async def _discard_notebook(client, notebook_id: str) -> None:
+    """Best-effort cleanup. A failed delete must never sink an otherwise good note."""
+    try:
+        await client.notebooks.delete(notebook_id)
+        logger.info("Deleted scratch notebook %s", notebook_id)
+    except Exception:
+        logger.warning("Could not delete scratch notebook %s", notebook_id, exc_info=True)
+
+
+async def fetch_answer(url: str, profile: str | None) -> str:
+    """Ask NotebookLM, retrying transient failures with exponential backoff.
+
+    Auth failures short-circuit: the session is gone and hammering it only makes
+    Google more suspicious of the account.
+    """
+    fatal_auth, retryable = _error_groups()
+    delay = INITIAL_BACKOFF_SECONDS
+    last_error: BaseException | None = None
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return await asyncio.wait_for(
+                _ask_notebooklm(url, profile), timeout=REQUEST_TIMEOUT_SECONDS
+            )
+        except fatal_auth as exc:
+            raise AuthExpired(str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise AuthExpired("storage_state.json is missing") from exc
+        except (*retryable, asyncio.TimeoutError) as exc:
+            last_error = exc
+            label = type(exc).__name__
+            if attempt == MAX_ATTEMPTS:
+                logger.error("%s on final attempt %d/%d", label, attempt, MAX_ATTEMPTS)
+                break
+            logger.warning(
+                "%s on attempt %d/%d, retrying in %.0fs", label, attempt, MAX_ATTEMPTS, delay
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+
+    assert last_error is not None
+    raise last_error
+
+
+async def create_note(url: str, vault_path: Path, profile: str | None) -> Path:
+    try:
+        import notebooklm  # noqa: F401
+    except ImportError:
+        fail("пакет не установлен. Выполни: python3 -m pip install notebooklm-py")
+
+    vault_path.mkdir(parents=True, exist_ok=True)
+
+    answer = await fetch_answer(url, profile)
+
+    response = ensure_frontmatter(answer, url)
     title = extract_title(response)
     filename = f"{slugify(title, f'video-{date.today()}')}.md"
     output_path = vault_path / filename

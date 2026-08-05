@@ -8,7 +8,7 @@ from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
-from script import create_note, upload_to_remote
+from script import AuthExpired, create_note, upload_to_remote
 
 
 TELEGRAM_MESSAGE_LIMIT = 3900
@@ -108,7 +108,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         note = output_path.read_text(encoding="utf-8")
         await send_note(message, note)
         logging.info("Saved %s to %s", url, output_path)
-    except BaseException:
+    except AuthExpired:
+        # Distinct from a normal failure: nothing about this link is wrong, the
+        # server just needs a fresh Google login. Say so instead of hiding it in
+        # a generic message, which is how this stayed broken for two months.
+        logging.error("NotebookLM auth expired while processing %s", url)
+        await message.reply_text(
+            "Авторизация NotebookLM истекла — нужен повторный вход на сервере. "
+            "Ссылка не обработана.",
+            disable_web_page_preview=True,
+        )
+    except Exception:
         logging.exception("Could not process %s", url)
         await message.reply_text(
             "Не смог обработать ссылку. Ошибка уже записана в лог сервера.",
