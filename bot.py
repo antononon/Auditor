@@ -5,8 +5,21 @@ import re
 import tempfile
 from pathlib import Path
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import (
+    BotCommand,
+    ForceReply,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from script import (
     AuthExpired,
@@ -83,6 +96,20 @@ async def send_note(message, note: str) -> None:
         await message.reply_text(chunk, disable_web_page_preview=True)
 
 
+# Telegram gives no way to pre-fill a reply box with existing text, so editing is
+# "here is the current prompt, send back the edited version". This line is what a
+# reply gets matched against to tell it apart from someone pasting a link.
+EDIT_REPLY_MARKER = "Пришли новый промпт ответом на это сообщение."
+
+MENU_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [InlineKeyboardButton("📝 Показать промпт", callback_data="prompt:show")],
+        [InlineKeyboardButton("✏️ Изменить промпт", callback_data="prompt:edit")],
+        [InlineKeyboardButton("↩️ Откатить правку", callback_data="prompt:undo")],
+    ]
+)
+
+
 def is_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     allowed_user_ids: set[int] = context.application.bot_data["allowed_user_ids"]
     user = update.effective_user
@@ -91,47 +118,42 @@ def is_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return user is not None and user.id in allowed_user_ids
 
 
-async def show_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send the current prompt so it can be copied, edited and sent back."""
+async def send_menu(message) -> None:
+    await message.reply_text(
+        "Управление промптом:", reply_markup=MENU_KEYBOARD, disable_web_page_preview=True
+    )
+
+
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update, context):
         return
+    await send_menu(update.effective_message)
 
-    message = update.effective_message
-    prompt = load_prompt_template()
 
-    await message.reply_text(
-        "Текущий промпт ниже. Скопируй, поправь и пришли обратно как:\n"
-        "/setprompt <текст>\n\n"
-        "Плейсхолдеры {source} и {date} должны остаться. "
-        "Откатить последнюю правку — /promptundo",
-        disable_web_page_preview=True,
-    )
+async def _send_current_prompt(message) -> None:
+    """The prompt itself, split as needed, with the menu offered again after it."""
     # Sent raw, with no parse_mode: the prompt is full of #, * and [] that any
     # markdown parser would either mangle or reject outright.
-    for chunk in split_telegram_message(prompt):
+    for chunk in split_telegram_message(load_prompt_template()):
         await message.reply_text(chunk, disable_web_page_preview=True)
+    await send_menu(message)
 
 
-async def set_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Replace the prompt with the text following the command, or a replied-to message."""
-    if not is_allowed(update, context):
-        return
+async def _ask_for_new_prompt(message) -> None:
+    """Open a reply box so the edited prompt can be sent straight back."""
+    await message.reply_text(
+        f"{EDIT_REPLY_MARKER}\n\n"
+        "Плейсхолдеры {source} и {date} должны остаться на месте.",
+        reply_markup=ForceReply(selective=True),
+        disable_web_page_preview=True,
+    )
 
-    message = update.effective_message
-    text = message.text or ""
 
-    # Everything after "/setprompt", newlines and all.
-    _, _, new_prompt = text.partition(" ")
-    if not new_prompt.strip() and message.reply_to_message:
-        new_prompt = message.reply_to_message.text or ""
-
+async def _apply_new_prompt(message, new_prompt: str) -> None:
+    """Validate and store an edited prompt, reporting either way."""
     new_prompt = new_prompt.strip()
     if not new_prompt:
-        await message.reply_text(
-            "После /setprompt нужен сам текст промпта "
-            "(или ответь этой командой на сообщение с ним).",
-            disable_web_page_preview=True,
-        )
+        await message.reply_text("Пустой текст — не сохранил.")
         return
 
     error = validate_prompt(new_prompt)
@@ -148,26 +170,20 @@ async def set_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     logging.info("Prompt updated (%d chars), backup: %s", len(new_prompt), backup)
     await message.reply_text(
-        f"Промпт сохранён ({len(new_prompt)} символов). "
-        "Применится со следующей ссылки. Откатить — /promptundo",
+        f"Промпт сохранён ({len(new_prompt)} символов). Применится со следующей ссылки.",
         disable_web_page_preview=True,
     )
+    await send_menu(message)
 
 
-async def undo_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Roll back to the version saved before the last edit."""
-    if not is_allowed(update, context):
-        return
-
-    message = update.effective_message
+async def _rollback_prompt(message) -> None:
     backup = latest_prompt_backup()
     if backup is None:
         await message.reply_text("Откатывать нечего — сохранённых версий нет.")
         return
 
     try:
-        previous = backup.read_text(encoding="utf-8")
-        save_prompt(previous)
+        save_prompt(backup.read_text(encoding="utf-8"))
     except OSError as exc:
         logging.exception("Could not restore prompt")
         await message.reply_text(f"Не смог восстановить: {exc}", disable_web_page_preview=True)
@@ -176,9 +192,66 @@ async def undo_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     logging.info("Prompt rolled back to %s", backup.name)
     await message.reply_text(
         f"Откатил к версии от {backup.stem.removeprefix('prompt-')}. "
-        "Ещё раз /promptundo вернёт обратно.",
-        disable_web_page_preview=True,
+        "Кнопка «Откатить» ещё раз вернёт обратно."
     )
+    await send_menu(message)
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dispatch the inline keyboard."""
+    query = update.callback_query
+    if not is_allowed(update, context):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    # Always answer, or the button keeps showing a spinner in the client.
+    await query.answer()
+    message = query.message
+
+    if query.data == "prompt:show":
+        await _send_current_prompt(message)
+    elif query.data == "prompt:edit":
+        await _ask_for_new_prompt(message)
+    elif query.data == "prompt:undo":
+        await _rollback_prompt(message)
+
+
+async def show_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the current prompt so it can be copied, edited and sent back."""
+    if not is_allowed(update, context):
+        return
+    await _send_current_prompt(update.effective_message)
+
+
+async def set_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Replace the prompt with the text following the command, or a replied-to message."""
+    if not is_allowed(update, context):
+        return
+
+    message = update.effective_message
+    text = message.text or ""
+
+    # Everything after "/setprompt", newlines and all.
+    _, _, new_prompt = text.partition(" ")
+    if not new_prompt.strip() and message.reply_to_message:
+        new_prompt = message.reply_to_message.text or ""
+
+    if not new_prompt.strip():
+        await message.reply_text(
+            "После /setprompt нужен сам текст промпта "
+            "(или ответь этой командой на сообщение с ним).",
+            disable_web_page_preview=True,
+        )
+        return
+
+    await _apply_new_prompt(message, new_prompt)
+
+
+async def undo_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Roll back to the version saved before the last edit."""
+    if not is_allowed(update, context):
+        return
+    await _rollback_prompt(update.effective_message)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -188,6 +261,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     message = update.effective_message
     text = message.text if message else None
     if not text:
+        return
+
+    # A reply to the "send me the new prompt" message is an edit, not a link.
+    replied_to = message.reply_to_message
+    if replied_to and EDIT_REPLY_MARKER in (replied_to.text or ""):
+        await _apply_new_prompt(message, text)
         return
 
     url = extract_youtube_url(text)
@@ -230,6 +309,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
+async def register_commands(app: Application) -> None:
+    """Publish the command list so it shows up in Telegram's menu button.
+
+    Without this the commands still work but are invisible, which is exactly how
+    a bot ends up looking like it has no controls at all.
+    """
+    await app.bot.set_my_commands(
+        [
+            BotCommand("menu", "Управление промптом"),
+            BotCommand("prompt", "Показать текущий промпт"),
+            BotCommand("setprompt", "Заменить промпт"),
+            BotCommand("promptundo", "Откатить последнюю правку"),
+        ]
+    )
+    logging.info("Bot commands registered with Telegram")
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -240,7 +336,7 @@ def main() -> None:
     logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 
     token = get_required_env("TELEGRAM_BOT_TOKEN")
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(register_commands).build()
 
     app.bot_data["allowed_user_ids"] = parse_allowed_user_ids()
     app.bot_data["vault"] = os.environ.get(
@@ -250,9 +346,11 @@ def main() -> None:
     app.bot_data["remote_vault"] = os.environ.get("OBSIDIAN_REMOTE_VAULT")
     app.bot_data["profile"] = os.environ.get("NOTEBOOKLM_PROFILE")
 
+    app.add_handler(CommandHandler(["start", "menu"], show_menu))
     app.add_handler(CommandHandler("prompt", show_prompt))
     app.add_handler(CommandHandler("setprompt", set_prompt))
     app.add_handler(CommandHandler("promptundo", undo_prompt))
+    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^prompt:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logging.info("Auditor Telegram bot started")
     app.run_polling(allowed_updates=Update.MESSAGE)

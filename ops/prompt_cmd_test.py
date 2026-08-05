@@ -1,4 +1,9 @@
-"""Exercises /prompt, /setprompt and /promptundo the way Telegram delivers them."""
+"""Exercises the prompt controls the way Telegram delivers them.
+
+Covers both entry points: the inline keyboard buttons and the slash commands,
+plus the ForceReply edit flow, which is the one that has to be told apart from
+someone pasting a YouTube link.
+"""
 
 import asyncio
 import os
@@ -16,9 +21,12 @@ class FakeMessage:
         self.text = text
         self.reply_to_message = reply_to
         self.replies = []
+        self.markups = []
 
     async def reply_text(self, text, **kwargs):
         self.replies.append(text)
+        self.markups.append(kwargs.get("reply_markup"))
+        return FakeMessage(text)
 
 
 class FakeUser:
@@ -26,10 +34,22 @@ class FakeUser:
         self.id = uid
 
 
+class FakeQuery:
+    def __init__(self, data, message, uid):
+        self.data = data
+        self.message = message
+        self.from_user = FakeUser(uid)
+        self.answered = []
+
+    async def answer(self, text=None, **kwargs):
+        self.answered.append(text)
+
+
 class FakeUpdate:
-    def __init__(self, message, uid=100000001):
+    def __init__(self, message=None, uid=100000001, query=None):
         self.effective_message = message
         self.effective_user = FakeUser(uid)
+        self.callback_query = query
 
 
 class FakeContext:
@@ -40,91 +60,106 @@ class FakeContext:
 ALLOWED = {100000001, 100000002}
 
 
-async def run_cmd(handler, text, uid=100000001, reply_to=None):
+async def press(data, uid=100000001):
+    msg = FakeMessage("Управление промптом:")
+    query = FakeQuery(data, msg, uid)
+    await bot.on_button(FakeUpdate(uid=uid, query=query), FakeContext(ALLOWED))
+    return msg, query
+
+
+async def send(handler, text, uid=100000001, reply_to=None):
     msg = FakeMessage(text, reply_to)
     await handler(FakeUpdate(msg, uid), FakeContext(ALLOWED))
-    return msg.replies
+    return msg
 
 
 async def main() -> int:
     original = script.load_prompt_template()
-    failures = []
+    fails = []
 
-    print("=== /prompt shows current prompt ===")
-    replies = await run_cmd(bot.show_prompt, "/prompt")
-    body = "\n".join(replies)
-    ok = len(replies) >= 2 and "строгий аналитик" in body
-    print(f"  replies: {len(replies)}, contains prompt: {'строгий аналитик' in body}")
-    for r in replies:
+    print("=== /menu offers three buttons ===")
+    msg = await send(bot.show_menu, "/menu")
+    markup = next((m for m in msg.markups if m is not None), None)
+    labels = [b.text for row in markup.inline_keyboard for b in row] if markup else []
+    print(f"  buttons: {labels}")
+    if len(labels) != 3:
+        fails.append("menu-buttons")
+
+    print("\n=== button: show prompt ===")
+    msg, query = await press("prompt:show")
+    body = "\n".join(msg.replies)
+    print(f"  replies: {len(msg.replies)}, contains prompt: {'строгий аналитик' in body}")
+    print(f"  callback answered: {query.answered == [None]}")
+    if "строгий аналитик" not in body or not query.answered:
+        fails.append("button-show")
+    for r in msg.replies:
         if len(r) > bot.TELEGRAM_MESSAGE_LIMIT:
-            ok = False
-            print("  !! chunk over telegram limit")
-    if not ok:
-        failures.append("/prompt")
+            fails.append("chunk-too-long")
 
-    print("\n=== /setprompt rejects a stray placeholder ===")
-    replies = await run_cmd(bot.set_prompt, "/setprompt Текст {source} {date} и {мусор}")
-    print(f"  -> {replies[0][:70]}")
-    if "Не сохранил" not in replies[0] or script.load_prompt_template() != original:
-        failures.append("setprompt-reject-placeholder")
+    print("\n=== button: edit opens a reply box ===")
+    msg, _ = await press("prompt:edit")
+    has_force = any(type(m).__name__ == "ForceReply" for m in msg.markups)
+    print(f"  marker sent: {bot.EDIT_REPLY_MARKER in msg.replies[0]}")
+    print(f"  ForceReply attached: {has_force}")
+    if bot.EDIT_REPLY_MARKER not in msg.replies[0] or not has_force:
+        fails.append("button-edit")
 
-    print("\n=== /setprompt rejects an unpaired brace ===")
-    replies = await run_cmd(bot.set_prompt, "/setprompt Текст {source} {date} и {")
-    print(f"  -> {replies[0][:70]}")
-    if "Не сохранил" not in replies[0] or script.load_prompt_template() != original:
-        failures.append("setprompt-reject-brace")
-
-    print("\n=== /setprompt with no text explains itself ===")
-    replies = await run_cmd(bot.set_prompt, "/setprompt")
-    print(f"  -> {replies[0][:70]}")
-    if "нужен сам текст" not in replies[0]:
-        failures.append("setprompt-empty")
-
-    print("\n=== /setprompt saves a valid multi-line prompt ===")
-    new_prompt = "ТЕСТ.\nИсточник: {source}\nДата: {date}\nЛитерал: {{ok}}"
-    replies = await run_cmd(bot.set_prompt, f"/setprompt {new_prompt}")
-    print(f"  -> {replies[0][:70]}")
+    print("\n=== replying to that box saves the prompt (not treated as a link) ===")
+    force_msg = FakeMessage(f"{bot.EDIT_REPLY_MARKER}\n\nтекст")
+    new_prompt = "ТЕСТ ЧЕРЕЗ КНОПКУ.\n{source} / {date}\nЛитерал: {{ok}}"
+    msg = await send(bot.handle_message, new_prompt, reply_to=force_msg)
+    print(f"  -> {msg.replies[0][:60]}")
     saved = script.load_prompt_template()
-    print(f"  saved correctly: {saved == new_prompt}")
+    print(f"  saved: {saved == new_prompt}")
     if saved != new_prompt:
-        failures.append("setprompt-save")
+        fails.append("reply-edit-save")
 
-    print("\n=== change is live for the next link ===")
+    print("\n=== live for the next link ===")
     q = script.build_query("https://youtu.be/XYZ")
-    print(f"  built query: {q!r}")
     if "https://youtu.be/XYZ" not in q or "{ok}" not in q:
-        failures.append("live-pickup")
+        fails.append("live-pickup")
+    print(f"  {q!r}")
 
-    print("\n=== /setprompt via reply to another message ===")
-    replied = FakeMessage("Из ответа: {source} {date}")
-    replies = await run_cmd(bot.set_prompt, "/setprompt", reply_to=replied)
-    print(f"  -> {replies[0][:70]}")
-    if script.load_prompt_template() != "Из ответа: {source} {date}":
-        failures.append("setprompt-reply")
+    print("\n=== invalid edit via reply is rejected ===")
+    msg = await send(bot.handle_message, "Плохой {мусор} {source} {date}", reply_to=force_msg)
+    print(f"  -> {msg.replies[0][:60]}")
+    if "Не сохранил" not in msg.replies[0] or script.load_prompt_template() != new_prompt:
+        fails.append("reply-edit-reject")
 
-    print("\n=== /promptundo rolls back ===")
-    replies = await run_cmd(bot.undo_prompt, "/promptundo")
-    print(f"  -> {replies[0][:70]}")
-    print(f"  back to previous edit: {script.load_prompt_template() == new_prompt}")
-    if script.load_prompt_template() != new_prompt:
-        failures.append("promptundo")
+    print("\n=== a real link is still recognised ===")
+    print(f"  extract_youtube_url: {bot.extract_youtube_url('https://youtu.be/E4Xkq9n6nl8')}")
+    if not bot.extract_youtube_url("https://youtu.be/E4Xkq9n6nl8"):
+        fails.append("link-still-works")
 
-    print("\n=== whitelist blocks a stranger ===")
-    replies = await run_cmd(bot.show_prompt, "/prompt", uid=111111)
-    print(f"  replies to non-whitelisted user: {len(replies)}")
-    if replies:
-        failures.append("whitelist")
+    print("\n=== button: undo ===")
+    msg, _ = await press("prompt:undo")
+    print(f"  -> {msg.replies[0][:60]}")
+    if script.load_prompt_template() == new_prompt:
+        fails.append("button-undo")
 
-    print("\n=== restoring original prompt ===")
+    print("\n=== /setprompt still works ===")
+    msg = await send(bot.set_prompt, "/setprompt Команда: {source} {date}")
+    print(f"  -> {msg.replies[0][:60]}")
+    if script.load_prompt_template() != "Команда: {source} {date}":
+        fails.append("setprompt")
+
+    print("\n=== stranger is refused, on buttons too ===")
+    msg = await send(bot.show_menu, "/menu", uid=999999)
+    _, query = await press("prompt:show", uid=999999)
+    print(f"  menu replies: {len(msg.replies)}, button alert: {query.answered}")
+    if msg.replies or query.answered == [None]:
+        fails.append("whitelist")
+
+    print("\n=== restoring original ===")
     script.save_prompt(original)
     print(f"  restored: {script.load_prompt_template() == original}")
     if script.load_prompt_template() != original:
-        failures.append("restore")
+        fails.append("restore")
 
-    if failures:
-        print(f"\nFAILED: {failures}")
+    if fails:
+        print(f"\nFAILED: {fails}")
         return 1
-    print("\nALL PROMPT COMMAND CHECKS PASSED")
+    print("\nALL PROMPT CONTROL CHECKS PASSED")
     return 0
 
 
